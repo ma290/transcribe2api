@@ -5,17 +5,7 @@ import time
 import urllib.parse
 from playwright.sync_api import sync_playwright
 
-from fastapi.middleware.cors import CORSMiddleware
-
 app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 BASE_URL = "https://audioconvert.ai/api"
 DEFAULT_HEADERS = {
@@ -25,46 +15,6 @@ DEFAULT_HEADERS = {
     "referer": "https://audioconvert.ai/mp3-to-text",
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 }
-
-
-def _first_present(*values):
-    for value in values:
-        if value not in (None, "", [], {}):
-            return value
-    return None
-
-
-def _extract_transcript_text(payload):
-    transcription = _first_present(
-        payload.get("transcription"),
-        payload.get("transcript"),
-        payload.get("result", {}).get("transcription"),
-        payload.get("result", {}).get("transcript"),
-        payload.get("data", {}).get("transcription"),
-        payload.get("data", {}).get("transcript"),
-        payload.get("data", {}).get("result", {}).get("transcription"),
-        payload.get("data", {}).get("result", {}).get("transcript"),
-    )
-
-    if isinstance(transcription, str) and transcription.strip():
-        return transcription
-
-    if isinstance(transcription, dict):
-        words = transcription.get("words") or transcription.get("segments") or []
-        if words:
-            parts = []
-            for item in words:
-                if isinstance(item, dict):
-                    text = item.get("text") or item.get("word") or item.get("content")
-                else:
-                    text = item
-                if isinstance(text, str) and text.strip():
-                    parts.append(text.strip())
-            if parts:
-                return " ".join(parts)
-
-    return None
-
 
 def get_fresh_token_via_webkit():
     print("Step 1: Initializing guest session & fetching token...")
@@ -187,38 +137,16 @@ def run_hybrid_api_workflow(audio_bytes: bytes, filename: str):
                 data_dict = poll_data.get("data") or {}
                 status = poll_data.get("status") or data_dict.get("status")
                 print(f"Attempt {attempt+1}: Status is '{status}' | Raw: {poll_data}")
-
-                result_payload = data_dict if isinstance(data_dict, dict) else {}
-                transcript_text = _extract_transcript_text(result_payload) or _extract_transcript_text(poll_data)
-                transcript_field = _first_present(
-                    result_payload.get("transcript"),
-                    poll_data.get("transcript"),
-                    result_payload.get("text"),
-                    poll_data.get("text"),
-                    transcript_text,
-                )
-                pdf_url = _first_present(
-                    result_payload.get("pdf_url"),
-                    poll_data.get("pdf_url"),
-                    result_payload.get("result", {}).get("pdf_url"),
-                    poll_data.get("result", {}).get("pdf_url"),
-                )
-                srt_url = _first_present(
-                    result_payload.get("srt_url"),
-                    poll_data.get("srt_url"),
-                    result_payload.get("result", {}).get("srt_url"),
-                    poll_data.get("result", {}).get("srt_url"),
-                )
-
-                if status in ["success", 3] or "transcript" in poll_data or "transcript" in result_payload or "transcription" in poll_data or "transcription" in result_payload or pdf_url or srt_url:
+                
+                if status in ["success", 3] or "transcript" in poll_data or "transcript" in data_dict:
                     print("Success! Response captured fully.")
                     return {
                         "success": True,
                         "task_id": task_id,
-                        "transcript": transcript_field,
-                        "pdf_url": pdf_url,
-                        "srt_url": srt_url,
-                        "full_response": poll_data,
+                        "transcript": data_dict.get("transcript") or poll_data.get("transcript"),
+                        "pdf_url": data_dict.get("pdf_url") or poll_data.get("pdf_url"),
+                        "srt_url": data_dict.get("srt_url") or poll_data.get("srt_url"),
+                        "full_response": poll_data
                     }
                 elif status in ["failed", 4, "error"]:
                     return {"success": False, "error": "Transcription failed internally on website backend."}
