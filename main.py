@@ -1,302 +1,174 @@
-"""
-Chunked Transcribe API
------------------------
-Ek hi /transcribe endpoint leta hai bade audio file ko, usko 5-5 minute ke
-chunks mein todta hai, har chunk ko upstream transcribe API (Koyeb wali)
-pe SEQUENTIALLY hit karta hai, aur saare responses ko timestamp-offset
-karke ek hi merged JSON mein wapas bhejta hai — same shape jaisa upstream
-API deta hai, taaki frontend (karaoke UI) bina kisi change ke chal jaaye.
-
-Run:
-    pip install fastapi uvicorn python-multipart pydub httpx --break-system-packages
-    uvicorn main:app --host 0.0.0.0 --port 8000
-
-Note: pydub ko system me ffmpeg chahiye (audio cut karne ke liye).
-Ubuntu/Debian: apt-get install -y ffmpeg
-Agar ffmpeg nahi mila, startup pe hi clear error aayega (neeck dekho).
-"""
-
-import os
-import io
-import uuid
-import shutil
-import logging
-import tempfile
-from typing import Optional
-
-import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
-from pydub import AudioSegment
-from pydub.utils import which
+from fastapi.concurrency import run_in_threadpool
+import httpx
+import time
+import urllib.parse
+from playwright.sync_api import sync_playwright
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("chunked-transcribe")
+app = FastAPI()
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-UPSTREAM_URL = os.environ.get(
-    "UPSTREAM_TRANSCRIBE_URL",
-    "https://slimy-melisa-ashutosh0879-af2acd0b.koyeb.app/transcribe",
-)
-CHUNK_MINUTES = 5
-CHUNK_MS = CHUNK_MINUTES * 60 * 1000  # 5 min in milliseconds
-UPSTREAM_TIMEOUT_SECONDS = float(os.environ.get("UPSTREAM_TIMEOUT_SECONDS", "600"))  # 10 min per chunk, tune as needed
+BASE_URL = "https://audioconvert.ai/api"
+DEFAULT_HEADERS = {
+    "accept": "application/json, text/plain, */*",
+    "accept-language": "en-US,en;q=0.8",
+    "origin": "https://audioconvert.ai",
+    "referer": "https://audioconvert.ai/mp3-to-text",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+}
 
-app = FastAPI(title="Chunked Transcribe API", version="1.0.0")
+def get_fresh_token_via_webkit():
+    print("Step 1: Initializing guest session & fetching token...")
+    with sync_playwright() as p:
+        browser = p.webkit.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+        
+        auth_token = None
+        
+        def intercept_response(response):
+            nonlocal auth_token
+            if "api/" in response.url:
+                req_headers = response.request.headers
+                if "authorization" in req_headers and req_headers["authorization"].startswith("Bearer "):
+                    auth_token = req_headers["authorization"]
 
-
-@app.on_event("startup")
-async def check_ffmpeg():
-    """Startup par hi check karle ki ffmpeg available hai ya nahi — taaki
-    request fail hone se pehle hi clear pata chal jaaye."""
-    ffmpeg_path = which("ffmpeg")
-    if ffmpeg_path is None:
-        log.error(
-            "ffmpeg NAHI mila system PATH mein! pydub iske bina audio cut "
-            "nahi kar payega. Install karo: 'apt-get install -y ffmpeg' "
-            "(Linux) ya deployment image mein ffmpeg add karo (Koyeb par "
-            "Dockerfile use karo agar buildpack mein ffmpeg nahi hai)."
-        )
-    else:
-        log.info(f"ffmpeg mil gaya: {ffmpeg_path}")
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def split_audio_into_chunks(audio: AudioSegment, chunk_ms: int) -> list[AudioSegment]:
-    """AudioSegment ko chunk_ms duration ke chunks mein todta hai."""
-    total_ms = len(audio)
-    chunks = []
-    start = 0
-    while start < total_ms:
-        end = min(start + chunk_ms, total_ms)
-        chunks.append(audio[start:end])
-        start = end
-    return chunks
-
-
-def shift_word_times(words: list, offset_seconds: float) -> list:
-    """Har word ke start/end mein offset add karta hai (in-place copy)."""
-    shifted = []
-    for w in words:
-        w2 = dict(w)
-        if w2.get("start") is not None:
-            w2["start"] = round(w2["start"] + offset_seconds, 3)
-        if w2.get("end") is not None:
-            w2["end"] = round(w2["end"] + offset_seconds, 3)
-        shifted.append(w2)
-    return shifted
-
-
-def shift_segment_times(segments: list, offset_seconds: float) -> list:
-    """Segments ke andar wale words ka time bhi shift karta hai."""
-    shifted = []
-    for seg in segments:
-        seg2 = dict(seg)
-        if "words" in seg2 and seg2["words"]:
-            seg2["words"] = shift_word_times(seg2["words"], offset_seconds)
-        shifted.append(seg2)
-    return shifted
-
-
-async def transcribe_single_chunk(
-    client: httpx.AsyncClient,
-    chunk_bytes: bytes,
-    filename: str,
-    content_type: str,
-) -> dict:
-    """Ek chunk ko upstream API pe bhejta hai aur JSON response wapas karta hai."""
-    files = {"file": (filename, chunk_bytes, content_type)}
-    resp = await client.post(UPSTREAM_URL, files=files, timeout=UPSTREAM_TIMEOUT_SECONDS)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def guess_export_format(content_type: Optional[str], filename: str) -> tuple[str, str]:
-    """Returns (pydub_export_format, mime_type) based on input file.
-    Hum chunks ko hamesha m4a (aac) mein export karenge taaki upstream
-    API ko consistent format mile — agar tum chaaho toh ye change kar
-    sakte ho (e.g. wav, mp3)."""
-    return "ipod", "audio/x-m4a"  # pydub "ipod" codec = m4a/aac container
-
-
-# ---------------------------------------------------------------------------
-# Main endpoint
-# ---------------------------------------------------------------------------
-
-@app.post("/transcribe")
-async def transcribe_chunked(file: UploadFile = File(...)):
-    """
-    Bada audio file accept karta hai, 5-5 min ke chunks mein todta hai,
-    har chunk ko upstream API pe SEQUENTIALLY bhejta hai, aur results ko
-    merge karke same-shape response return karta hai jaisa upstream API
-    deta hai (success, task_id, transcript text, full_response.data...).
-    """
-    if which("ffmpeg") is None:
-        raise HTTPException(
-            status_code=500,
-            detail="ffmpeg server par install nahi hai. pydub ko audio "
-                   "cut karne ke liye ffmpeg chahiye. Deployment image "
-                   "mein ffmpeg add karo.",
-        )
-
-    raw_bytes = await file.read()
-    if not raw_bytes:
-        raise HTTPException(status_code=400, detail="Empty file mila.")
-
-    # Temp file mein likho taaki pydub/ffmpeg use kar sake (format auto-detect)
-    suffix = os.path.splitext(file.filename or "")[1] or ".m4a"
-    tmp_dir = tempfile.mkdtemp(prefix="chunked_transcribe_")
-    input_path = os.path.join(tmp_dir, f"input{suffix}")
-
-    try:
-        with open(input_path, "wb") as f:
-            f.write(raw_bytes)
-
-        log.info(f"Loading audio: {file.filename} ({len(raw_bytes)} bytes)")
+        page.on("response", intercept_response)
+        
         try:
-            audio = AudioSegment.from_file(input_path)
+            page.goto("https://audioconvert.ai/mp3-to-text", wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(3500)
         except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Audio file decode nahi ho payi (ffmpeg/pydub error): {e}",
-            )
+            print(f"WebKit token capture warning: {e}")
+        finally:
+            try:
+                context.clear_cookies()
+            except:
+                pass
+            context.close()
+            browser.close()
+            
+        if auth_token:
+            return auth_token
+        else:
+            # Fallback static token
+            return "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiIzNGM4MjFiYy1iNzliLTRmNGItODE4OS1kNjEzMjk3NTFiMGMifQ.Wxm6x3nHKtVKxuT4l-IftA3_kJj-9612KlUlbbtZFzA"
 
-        total_duration_sec = len(audio) / 1000.0
-        log.info(f"Total duration: {total_duration_sec:.1f}s")
+def run_hybrid_api_workflow(audio_bytes: bytes, filename: str):
+    auth_token = get_fresh_token_via_webkit()
+    encoded_filename = urllib.parse.quote(filename)
+    
+    request_headers = DEFAULT_HEADERS.copy()
+    request_headers["authorization"] = auth_token
+    
+    # Infinite timeout setup to bypass client-side write timeouts
+    custom_timeout = httpx.Timeout(None)
+    
+    with httpx.Client(headers=request_headers, timeout=custom_timeout) as client:
+        
+        # --- STEP 2: Presign URL ---
+        print("Step 2: Requesting presigned upload URL...")
+        presign_res = client.get(f"{BASE_URL}/resource/upload/presign?filename={encoded_filename}")
+        if presign_res.status_code != 200:
+            raise Exception(f"Failed to get presign URL: {presign_res.text}")
+            
+        presign_data = presign_res.json()
+        print(f"Presign Data Logged: {presign_data}")
+        
+        # Exact response dict key structure match
+        inner_data = presign_data.get("data", {})
+        upload_url = inner_data.get("upload_url") or inner_data.get("uploadUrl") or presign_data.get("uploadUrl")
+        
+        if not upload_url:
+            raise Exception(f"Upload URL missing from response schema: {presign_data}")
 
-        chunks = split_audio_into_chunks(audio, CHUNK_MS)
-        log.info(f"{len(chunks)} chunk(s) banaye (each ~{CHUNK_MINUTES} min)")
+        # Final audio link bina query parameters ke nikala (Aliyun Storage URL)
+        final_audio_url = upload_url.split('?')[0]
 
-        export_format, content_type = guess_export_format(file.content_type, file.filename or "")
-
-        merged_words: list = []
-        merged_segments: list = []
-        merged_text_parts: list = []
-        language_code: Optional[str] = None
-        any_success = False
-        chunk_results_meta = []  # debugging/visibility ke liye
-
-        async with httpx.AsyncClient() as client:
-            for idx, chunk in enumerate(chunks):
-                offset_seconds = idx * CHUNK_MINUTES * 60
-                chunk_filename = f"chunk_{idx + 1}{os.path.splitext(file.filename or '.m4a')[1] or '.m4a'}"
-
-                log.info(
-                    f"[{idx + 1}/{len(chunks)}] Exporting chunk "
-                    f"(offset={offset_seconds}s, len={len(chunk) / 1000:.1f}s)..."
-                )
-
-                buf = io.BytesIO()
-                chunk.export(buf, format=export_format)
-                chunk_bytes = buf.getvalue()
-
-                log.info(f"[{idx + 1}/{len(chunks)}] Sending to upstream API...")
-                try:
-                    result = await transcribe_single_chunk(
-                        client, chunk_bytes, chunk_filename, content_type
-                    )
-                except httpx.HTTPStatusError as e:
-                    log.error(f"[{idx + 1}/{len(chunks)}] Upstream HTTP error: {e}")
-                    chunk_results_meta.append({"chunk": idx + 1, "status": "failed", "error": str(e)})
-                    continue
-                except httpx.RequestError as e:
-                    log.error(f"[{idx + 1}/{len(chunks)}] Upstream request error: {e}")
-                    chunk_results_meta.append({"chunk": idx + 1, "status": "failed", "error": str(e)})
-                    continue
-
-                if not result.get("success"):
-                    log.warning(f"[{idx + 1}/{len(chunks)}] Upstream success=false, skipping merge for this chunk.")
-                    chunk_results_meta.append({"chunk": idx + 1, "status": "upstream_failed", "raw": result})
-                    continue
-
-                any_success = True
-                transcription = (
-                    result.get("full_response", {})
-                    .get("data", {})
-                    .get("transcription", {})
-                )
-
-                if language_code is None:
-                    language_code = transcription.get("language_code")
-
-                chunk_text = transcription.get("text", "")
-                if chunk_text:
-                    merged_text_parts.append(chunk_text.strip())
-
-                chunk_words = transcription.get("words", []) or []
-                merged_words.extend(shift_word_times(chunk_words, offset_seconds))
-
-                chunk_segments = transcription.get("segments", []) or []
-                merged_segments.extend(shift_segment_times(chunk_segments, offset_seconds))
-
-                chunk_results_meta.append({"chunk": idx + 1, "status": "ok", "task_id": result.get("task_id")})
-
-                log.info(f"[{idx + 1}/{len(chunks)}] Done. words={len(chunk_words)} segments={len(chunk_segments)}")
-
-        if not any_success:
-            raise HTTPException(
-                status_code=502,
-                detail="Koi bhi chunk upstream API se successfully transcribe nahi ho paya.",
-            )
-
-        merged_task_id = f"merged_{uuid.uuid4().hex[:20]}"
-
-        final_response = {
-            "success": True,
-            "task_id": merged_task_id,
-            "transcript": None,
-            "pdf_url": None,
-            "srt_url": None,
-            "full_response": {
-                "code": 100000,
-                "message": "success",
-                "data": {
-                    "id": merged_task_id,
-                    "status": "success",
-                    "model_task_id": merged_task_id,
-                    "scenario": "auto",
-                    "audio_url": None,
-                    "file_duration": round(total_duration_sec),
-                    "file_size": len(raw_bytes),
-                    "file_format": suffix.lstrip("."),
-                    "file_name": file.filename,
-                    "language": None,
-                    "progress": 1,
-                    "remain_time": None,
-                    "source_type": "file",
-                    "source_url": None,
-                    "transcription": {
-                        "language_code": language_code,
-                        "text": " ".join(merged_text_parts),
-                        "words": merged_words,
-                        "segments": merged_segments,
-                    },
-                },
-            },
-            "_chunking_meta": {
-                "chunk_minutes": CHUNK_MINUTES,
-                "total_chunks": len(chunks),
-                "chunk_results": chunk_results_meta,
-                "total_duration_seconds": round(total_duration_sec, 1),
-            },
+        # --- STEP 3: Cloud Storage Upload ---
+        print("Step 3: Uploading audio bytes directly to cloud storage...")
+        upload_headers = {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(audio_bytes)),
+            "Connection": "keep-alive"
         }
+        
+        # Use httpx.put to prevent sending Authorization header that breaks OSS signature
+        # Also, do NOT send custom headers (like Content-Type), as they break the pre-signed URL signature!
+        upload_res = httpx.put(upload_url, content=audio_bytes, timeout=None)
+        if upload_res.status_code not in [200, 201]:
+            raise Exception(f"Cloud storage PUT upload failed ({upload_res.status_code}): {upload_res.text}")
+        print("Upload to Cloud Storage Successful!")
 
-        return JSONResponse(content=final_response)
+        # --- STEP 4: Quota verification ---
+        print("Step 4: Confirming guest limits...")
+        try:
+            client.post(f"{BASE_URL}/transcribe/check-guest-quota", json={"duration_minutes": 6})
+        except:
+            pass
 
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        # --- STEP 5: Trigger Transcription Task ---
+        print("Step 5: Activating transcription pipeline...")
+        transcribe_payload = {
+            "audio_url": final_audio_url,
+            "language_code": "",
+            "file_name": filename,
+            "scenario": "auto"
+        }
+        
+        task_res = client.post(f"{BASE_URL}/transcribe/", json=transcribe_payload)
+        if task_res.status_code not in [200, 201]:
+            raise Exception(f"Failed to trigger task: {task_res.text}")
+            
+        task_data = task_res.json()
+        task_id = task_data.get("id") or task_data.get("data", {}).get("id")
+        if not task_id:
+            raise Exception(f"Task ID allocation failed. Response: {task_data}")
 
+        # --- STEP 6: Capture Response via Polling Loop ---
+        print(f"Step 6: Polling status for Task ID: {task_id} ...")
+        polling_url = f"{BASE_URL}/transcribe/{task_id}"
+        
+        for attempt in range(120):  # Wait up to 6 minutes
+            poll_res = client.get(polling_url)
+            if poll_res.status_code == 200:
+                poll_data = poll_res.json()
+                
+                # Extract inner data object
+                data_dict = poll_data.get("data") or {}
+                status = poll_data.get("status") or data_dict.get("status")
+                print(f"Attempt {attempt+1}: Status is '{status}' | Raw: {poll_data}")
+                
+                if status in ["success", 3] or "transcript" in poll_data or "transcript" in data_dict:
+                    print("Success! Response captured fully.")
+                    return {
+                        "success": True,
+                        "task_id": task_id,
+                        "transcript": data_dict.get("transcript") or poll_data.get("transcript"),
+                        "pdf_url": data_dict.get("pdf_url") or poll_data.get("pdf_url"),
+                        "srt_url": data_dict.get("srt_url") or poll_data.get("srt_url"),
+                        "full_response": poll_data
+                    }
+                elif status in ["failed", 4, "error"]:
+                    return {"success": False, "error": "Transcription failed internally on website backend."}
+            
+            time.sleep(3)
+            
+        return {"success": False, "error": "Polling timeout exceeded."}
 
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "ffmpeg_available": which("ffmpeg") is not None,
-        "chunk_minutes": CHUNK_MINUTES,
-        "upstream_url": UPSTREAM_URL,
-    }
+# Back to stable UploadFile format, stream handling threadpool handle karega
+@app.post("/transcribe")
+async def transcribe(file: UploadFile = File(...)):
+    try:
+        audio_bytes = await file.read()
+        if not audio_bytes:
+            raise HTTPException(status_code=400, detail="Empty file payload.")
+            
+        result = await run_in_threadpool(run_hybrid_api_workflow, audio_bytes, file.filename)
+        return result
+    except Exception as e:
+        print(f"Fatal error in endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/")
+def health():
+    return {"status": "ok", "engine": "fastapi-ihttp-fixed"}
