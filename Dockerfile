@@ -11,4 +11,4 @@ RUN playwright install --with-deps webkit
 
 EXPOSE 8000
 
-CMD ["uvicorn", "ihttp:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
