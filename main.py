@@ -1,4 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 import httpx
 import time
@@ -6,6 +7,15 @@ import urllib.parse
 from playwright.sync_api import sync_playwright
 
 app = FastAPI()
+
+# Allow browser requests from any origin (required for client-side fetch)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 BASE_URL = "https://audioconvert.ai/api"
 DEFAULT_HEADERS = {
